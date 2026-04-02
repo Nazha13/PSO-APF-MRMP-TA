@@ -1,0 +1,87 @@
+# TrajectoryPlannerROS:
+#   # ==========================================
+#   # 1. CRISP TUNING (Speed 6)
+#   # ==========================================
+#   # 6 (hardware) / 50 (scale) = 0.12 rad/s
+#   max_vel_theta: 0.25
+#   min_vel_theta: -0.12
+  
+#   # CRITICAL: Tell planner we CANNOT spin slower than Speed 6.
+#   # This stops it from trying to make impossible micro-turns.
+#   min_in_place_vel_theta: 0.12
+
+#   # Snappy acceleration so it starts/stops turns instantly
+#   acc_lim_theta: 1.0  
+  
+#   # ==========================================
+#   # 2. LINEAR SPEED (Keep Speed 7-10)
+#   # ==========================================
+#   max_vel_x: 0.10  # 0.08 m/s -> Speed 8
+#   min_vel_x: 0.02
+
+#   holonomic_robot: false
+#   max_vel_y: 0.0
+#   min_vel_y: 0.0
+#   acc_lim_x: 0.3
+#   acc_lim_y: 0.0
+
+#   # ==========================================
+#   # 3. TOLERANCE (Controlled Oscillation)
+#   # ==========================================
+#   # Tighter than "Sloppy Mode" (0.50) to force better alignment,
+#   # but loose enough (0.35 = ~20 deg) to accept the chunky turns.
+#   yaw_goal_tolerance: 0.50  
+#   xy_goal_tolerance:  0.20
+#   latch_xy_goal_tolerance: true
+
+#   # ==========================================
+#   # 4. PATH FOLLOWING
+#   # ==========================================
+#   # Look ahead to anticipate corners
+#   heading_lookahead: 0.4 
+#   heading_scoring: true
+  
+#   pdist_scale: 0.8
+#   gdist_scale: 0.05
+#   occdist_scale: 0.05
+
+#   # ==========================================
+#   # 5. SAFETY
+#   # ==========================================
+#   sim_time: 3.0
+#   dwa: false
+#   escape_vel: -0.04
+#   oscillation_reset_dist: 0.05
+
+TrajectoryPlannerROS:
+
+  # Robot Config Params
+  acc_lim_x: 1.0
+  acc_lim_y: 1.0
+  acc_lim_theta: 1.0
+  max_vel_x: 0.15 
+  min_vel_x: 0.1 
+  max_vel_theta: 0.5
+  min_vel_theta: -0.5
+  min_in_place_vel_theta: 0.2   # 0.2
+  escape_vel: -0.1
+  holonomic_robot: false
+  # y_vels: [-0.2, -0.1, 0.1, 0.2]
+
+  # Goal Tolerance Params
+  yaw_goal_tolerance: 0.2
+  xy_goal_tolerance: 0.1
+  latch_xy_goal_tolerance: false
+  heading_scoring: true
+
+  # Forward Simulation Params
+  sim_time: 1.5
+  sim_granularity: 0.01
+  angular_sim_granularity: 0.025
+  vx_samples: 5.0
+  vtheta_samples: 40.0
+
+  # Trajectory Scoring Params
+  pdist_scale: 2.0           # 0.6
+  gdist_scale: 0.05
+  occdist_scale: 0.02

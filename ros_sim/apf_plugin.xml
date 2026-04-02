@@ -1,0 +1,7 @@
+<library path="lib/libapf">
+  <class name="apf/APFPlanner" type="APF::APFPlanner" base_class_type="nav_core::BaseLocalPlanner">
+    <description>
+      A custom APF local planner.
+    </description>
+  </class>
+</library>

@@ -1,0 +1,322 @@
+geometry_msgs::Point quadraticBezier(geometry_msgs::Point p0, geometry_msgs::Point p1, geometry_msgs::Point p2, double t) {
+    geometry_msgs::Point p;
+    double u = 1 - t;
+    double tt = t * t;
+    double uu = u * u;
+
+    // Formula: (1-t)^2 * P0 + 2(1-t)t * P1 + t^2 * P2
+    p.x = (uu * p0.x) + (2 * u * t * p1.x) + (tt * p2.x);
+    p.y = (uu * p0.y) + (2 * u * t * p1.y) + (tt * p2.y);
+    p.z = 0;
+    
+    return p;
+}
+
+
+
+
+ros::Publisher path_pub = nh.advertise<nav_msgs::Path>("global_path", 1, true);
+    nav_msgs::Path gui_path;
+    gui_path.header.frame_id = "map";
+    gui_path.header.stamp = ros::Time::now();
+
+    double tightness = 0.75;
+
+    std::vector<Coordinate> p; 
+    p.push_back(real_start);
+    for(int i = 0; i < final_path.size(); ++i) {
+        Coordinate c;
+        c.x = nodes[final_path[i]].x;
+        c.y = nodes[final_path[i]].y;
+        p.push_back(c);
+    }
+    p.push_back(real_goal);
+
+    if (p.size() >= 3) {
+        for (int i = 0; i < p.size() - 2; ++i) {
+            
+            Coordinate p0 = p[i];     
+            Coordinate p1 = p[i+1];   
+            Coordinate p2 = p[i+2];   
+
+            double start_x = p0.x * (1 - tightness) + p1.x * tightness;
+            double start_y = p0.y * (1 - tightness) + p1.y * tightness;
+            
+            double end_x = p1.x * tightness + p2.x * (1 - tightness);
+            double end_y = p1.y * tightness + p2.y * (1 - tightness);
+
+            if (i == 0) {
+                start_x = p0.x;
+                start_y = p0.y;
+            }
+
+            if (i == p.size() - 3) {
+                end_x = p2.x;
+                end_y = p2.y;
+            }
+
+            for (double t = 0.0; t <= 1.0; t += 0.02) {
+                geometry_msgs::PoseStamped pose;
+                pose.header.frame_id = "map";
+                
+                double u = 1.0 - t;
+                
+                // Quadratic Bezier: (1-t)^2 * Start + 2(1-t)t * Corner + t^2 * End
+                pose.pose.position.x = (u*u * start_x) + (2*u*t * p1.x) + (t*t * end_x);
+                pose.pose.position.y = (u*u * start_y) + (2*u*t * p1.y) + (t*t * end_y);
+                
+                pose.pose.orientation.w = 1.0;
+                gui_path.poses.push_back(pose);
+            }
+        }
+    }
+
+    path_pub.publish(gui_path);
+    ros::spin();
+
+     double min_dist_start = 10000.0;
+    double min_dist_goal = 10000.0;
+
+    for(int i = 0; i < nodes.size(); ++i){
+        double dist_to_start = std::sqrt(std::pow(real_start.x - nodes[i].x,2) + std::pow(real_start.y - nodes[i].y,2));
+        double dist_to_goal = std::sqrt(std::pow(real_goal.x - nodes[i].x,2) + std::pow(real_goal.y - nodes[i].y,2));
+        if(dist_to_start < min_dist_start){
+            min_dist_start = dist_to_start;
+            dummy_start_id = i;
+        }
+        if(dist_to_goal < min_dist_goal){
+            min_dist_goal = dist_to_goal;
+            dummy_goal_id = i;
+        }
+    }
+
+    Particle swarm[swarm_size];
+    Global gBest;
+
+    for(int i = 0; i < swarm_size; ++i){
+        swarm[i].pos_i.resize(nodes.size());
+        swarm[i].velo.resize(nodes.size());
+        swarm[i].pBestPos.resize(nodes.size());
+    }
+
+    gBest.g_pos.resize(nodes.size());
+
+    gBest.g_score = 100000.0; // distance large enough
+
+    // PSO : Initialization section
+    // Init Value (each particles) at t = 0
+    for(int i = 0; i < swarm_size; ++i){
+        for(int j = 0; j < nodes.size(); ++j){
+            swarm[i].pos_i[j] = randdbl(0.0,1.0);
+            swarm[i].velo[j] = 0.0;
+            swarm[i].pBestPos[j] = swarm[i].pos_i[j];
+        }
+        swarm[i].pBest_score = calculateFitness(&swarm[i],nodes.data());
+        swarm[i].score = calculateFitness(&swarm[i],nodes.data());
+    }
+
+    // Init Value of gBest amongst all particles
+    for(int i = 0 ; i < swarm_size ; ++i){
+        if(swarm[i].score < gBest.g_score){
+            gBest.g_score = swarm[i].score;
+
+            for(int j = 0; j < nodes.size() ; ++j){
+                gBest.g_pos[j] = swarm[i].pos_i[j];
+            }
+        }
+    }
+
+    // Iteration loop (start at t = 1)
+    for(int i = 0; i < max_iter; ++i){
+        // Particle loop
+        for(int j = 0; j < swarm_size; ++j){
+            for(int k = 0; k < nodes.size(); ++k){
+                r1 = randdbl(0,1);
+                r2 = randdbl(0,1);
+
+                // PSO velocity and position updates
+                swarm[j].velo[k] = w*swarm[j].velo[k] + c1*(swarm[j].pBestPos[k] - swarm[j].pos_i[k])*r1 + c2*(gBest.g_pos[k] - swarm[j].pos_i[k])*r2;
+                swarm[j].pos_i[k] += swarm[j].velo[k];
+            }
+            swarm[j].score = calculateFitness(&swarm[j],nodes.data());
+
+            if(swarm[j].score < swarm[j].pBest_score){
+                swarm[j].pBest_score = swarm[j].score;
+
+                for(int k = 0; k < nodes.size(); ++k){
+                    swarm[j].pBestPos[k] = swarm[j].pos_i[k];
+                }
+            }
+
+            if(swarm[j].score < gBest.g_score){
+                gBest.g_score = swarm[j].score;
+
+                for(int k = 0; k < nodes.size(); ++k){
+                    gBest.g_pos[k] = swarm[j].pos_i[k];
+                }
+            }
+
+        }
+    }
+
+    std::vector<int> final_path = calculateFinale(&gBest, nodes.data());
+
+    std::cout << " ( " << real_start.x << ", " << real_start.y << " ) -> ";
+
+    for(int i = 0; i < final_path.size(); ++i){
+        std::cout << "( " << nodes[final_path[i]].x << ", " << nodes[final_path[i]].y << " ) -> ";
+        
+    }
+
+    std::cout << "( " << real_goal.x << ", " << real_goal.y << " )" << std::endl;
+    
+    // Uncomment to debug PSO
+
+    // for(int i = 0 ; i < gBest.g_pos.size() ; ++i){
+        // std::cout << gBest.g_pos[i] << std::endl;
+    // }
+
+    /*std::cout << gBest.g_score << std::endl;*/
+
+    // Path smoothing and publishing section
+
+    // Init path publisher
+    ros::Publisher path_pub = nh.advertise<nav_msgs::Path>("/pso_path", 10, true);
+    nav_msgs::Path final_pso_path;
+    final_pso_path.header.frame_id = "map";
+    final_pso_path.header.stamp = ros::Time::now();
+
+    // Storing full solution from start to goal
+    std::vector<Coordinate> path_p;
+    path_p.push_back(real_start);
+
+    for(int i = 0; i < final_path.size(); ++i){
+        Coordinate temp;
+        temp.x = nodes[final_path[i]].x;
+        temp.y = nodes[final_path[i]].y;
+        path_p.push_back(temp);
+    }
+
+    path_p.push_back(real_goal);
+
+    double t_step = 0.002;
+
+    int steps = 1.0 / t_step;
+
+    // Curve every 3 points (Quadratic Bezier)
+    for (int i = 0; i < path_p.size() - 2; i += 2){
+
+        Coordinate p0 = path_p[i];
+        Coordinate p1 = path_p[i + 1];
+        Coordinate p2 = path_p[i + 2];
+
+        for (int j = 0; j <= steps; ++j){
+            double t = j * t_step;
+
+            geometry_msgs::PoseStamped pose;
+            pose.header.frame_id = "map";
+            pose.header.stamp = ros::Time::now();
+
+            // Bezier curve calculation
+            double u = 1 - t;
+            double tt = t * t;
+            double uu = u * u;
+            double uut = 2 * u * t;
+
+            pose.pose.position.x = uu * p0.x + uut * p1.x + tt * p2.x;
+            pose.pose.position.y = uu * p0.y + uut * p1.y + tt * p2.y;
+            pose.pose.position.z = 0.0;
+
+            pose.pose.orientation.w = 1.0; 
+            final_pso_path.poses.push_back(pose);
+        }
+    }
+
+    if (path_p.size() % 2 == 0) {
+        // If solution is an even number
+
+        Coordinate last_point = path_p.back();
+        Coordinate second_last_point = path_p[path_p.size() - 2];
+
+        for (int j = 0; j <= steps; ++j){
+            double t = j * t_step;
+            geometry_msgs::PoseStamped pose;
+            pose.header.frame_id = "map";
+            pose.header.stamp = ros::Time::now();
+
+            double u = 1 - t;
+
+            // Linear Bezier for last 2 points
+            pose.pose.position.x = u * second_last_point.x + t * last_point.x;
+            pose.pose.position.y = u * second_last_point.y + t * last_point.y;
+            pose.pose.position.z = 0.0;
+            pose.pose.orientation.w = 1.0; 
+            final_pso_path.poses.push_back(pose);
+        }
+    }
+
+    path_pub.publish(final_pso_path);
+
+    // So it keeps listening and publishing new paths
+    map_received = false;
+    start_received = false;
+    goal_received = false;
+    
+    ros::spin();
+    
+
+    if(!ros::ok()){
+        return 0;
+    }
+
+
+    for (int i = 0; i < path_p.size() - 2; i += 2){
+
+                Coordinate p0 = path_p[i];
+                Coordinate p1 = path_p[i + 1];
+                Coordinate p2 = path_p[i + 2];
+
+                for (int j = 0; j <= steps; ++j){
+                    double t = j * t_step;
+
+                    geometry_msgs::PoseStamped pose;
+                    pose.header.frame_id = "map";
+                    pose.header.stamp = ros::Time::now();
+
+                    // Bezier curve calculation
+                    double u = 1 - t;
+                    double tt = t * t;
+                    double uu = u * u;
+                    double uut = 2 * u * t;
+
+                    pose.pose.position.x = uu * p0.x + uut * p1.x + tt * p2.x;
+                    pose.pose.position.y = uu * p0.y + uut * p1.y + tt * p2.y;
+                    pose.pose.position.z = 0.0;
+
+                    pose.pose.orientation.w = 1.0; 
+                    final_pso_path.poses.push_back(pose);
+                }
+            }
+
+            if (path_p.size() % 2 == 0) {
+                // If solution is an even number
+
+                Coordinate last_point = path_p.back();
+                Coordinate second_last_point = path_p[path_p.size() - 2];
+
+                for (int j = 0; j <= steps; ++j){
+                    double t = j * t_step;
+                    geometry_msgs::PoseStamped pose;
+                    pose.header.frame_id = "map";
+                    pose.header.stamp = ros::Time::now();
+
+                    double u = 1 - t;
+
+                    // Linear Bezier for last 2 points
+                    pose.pose.position.x = u * second_last_point.x + t * last_point.x;
+                    pose.pose.position.y = u * second_last_point.y + t * last_point.y;
+                    pose.pose.position.z = 0.0;
+                    pose.pose.orientation.w = 1.0; 
+                    final_pso_path.poses.push_back(pose);
+                }
+            }
