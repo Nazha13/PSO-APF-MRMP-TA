@@ -38,31 +38,32 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
         double k_att = 3.0;
         double f_att_x = 0.0;
         double f_att_y = 0.0;
-        double k_rep = 3.0;
+        double k_rep = 1.5;
         double f_rep_x = 0.0;
         double f_rep_y = 0.0;
-        double d0 = 0.85;
+        double d0 = 0.7;
 
-        double k_side = 1.5;
-        int b = 0;
-        double alpha = 13.7;
+        // Fallback within fallback SM variables
+        enum apf_state {NORMAL, AVOIDANCE};
 
-        double last_obs_x_ = 0.0;
-        double last_obs_y_ = 0.0;
-        int last_b_ = 0;
+        apf_state current_state_ = NORMAL;
 
-        ros::Time last_obs_time_;
+        double prev_ftotal_x = 0.0;
+        double prev_ftotal_y = 0.0;
 
+        int local_minima_counter_ = 0;
+        int local_minima_threshold_ = 50;
+
+        double v_target_x = 0.0;
+        double v_target_y = 0.0;
+
+        // Wp tracking variables
         int current_progress_id = 0;
 
         double lookahead_dist = 0.65;
         double target_yaw = 0.0;
 
-        int dodge_dir = 0;
-
-        bool is_aligning_ = true;
-
-        bool is_stuck_ = false;
+        bool is_safe_ = true;
 
     public:
         APFPlanner() {}
@@ -86,10 +87,6 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             global_plan_ = plan;
             current_progress_id = 0;
 
-            is_aligning_ = true;
-
-            is_stuck_ = false;
-
             return true;
         }
 
@@ -100,11 +97,8 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             f_att_x = 0.0; f_att_y = 0.0;
             f_rep_x = 0.0; f_rep_y = 0.0;
 
-            // reset counter
-            b = 0;
-
             // reset obs vars
-            double min_dist_obs = d0;
+            double min_dist_obs = 1000000.0;
             double closest_obs_x = 0.0;
             double closest_obs_y = 0.0;
             bool found_any_obs = false;
@@ -161,32 +155,66 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                 }
             }
 
-            // Scan for obstacles
-            for(int i = 0; i < size_x; ++i){
-                for(int j = 0; j < size_y; ++j){
+            double scan_radius = 1.0; 
+            int radius_cells = std::ceil(scan_radius / costmap->getResolution());
 
-                    if(costmap->getCost(i,j) >= 50){
+            unsigned int robot_mx, robot_my;
+            if (costmap->worldToMap(robot_x, robot_y, robot_mx, robot_my)) {
+                
+                int min_x = std::max(0, (int)robot_mx - radius_cells);
+                int max_x = std::min((int)size_x - 1, (int)robot_mx + radius_cells);
+                int min_y = std::max(0, (int)robot_my - radius_cells);
+                int max_y = std::min((int)size_y - 1, (int)robot_my + radius_cells);
 
-                        double obs_x;
-                        double obs_y;
-                        costmap->mapToWorld(i, j, obs_x, obs_y);
+                for(int i = min_x; i <= max_x; ++i){
+                    for(int j = min_y; j <= max_y; ++j){
 
-                        double dist_to_obs = std::sqrt(std::pow(obs_x - robot_x, 2) + std::pow(obs_y - robot_y, 2));
+                        if(costmap->getCost(i,j) >= 50){
 
-                        if(dist_to_obs < d0 && dist_to_obs > 0.35){
-                            // Obstacle count
-                            b++;
+                            double obs_x;
+                            double obs_y;
+                            costmap->mapToWorld(i, j, obs_x, obs_y);
 
-                            if(dist_to_obs < min_dist_obs){
-                                min_dist_obs = dist_to_obs;
-                                closest_obs_x = obs_x;
-                                closest_obs_y = obs_y;
-                                found_any_obs = true;
+                            double dist_to_obs = std::hypot(obs_x - robot_x, obs_y - robot_y);
+
+                            if(dist_to_obs < d0){
+                                if(dist_to_obs < min_dist_obs){
+                                    min_dist_obs = dist_to_obs;
+                                    closest_obs_x = obs_x;
+                                    closest_obs_y = obs_y;
+                                    found_any_obs = true;
+                                }
                             }
                         }
                     }
                 }
+            } else {
+                ROS_WARN_THROTTLE(1.0, "APF: Robot is off the costmap!");
             }
+
+            // Scan for obstacles
+            // for(int i = 0; i < size_x; ++i){
+            //     for(int j = 0; j < size_y; ++j){
+
+            //         if(costmap->getCost(i,j) >= 50){
+
+            //             double obs_x;
+            //             double obs_y;
+            //             costmap->mapToWorld(i, j, obs_x, obs_y);
+
+            //             double dist_to_obs = std::sqrt(std::pow(obs_x - robot_x, 2) + std::pow(obs_y - robot_y, 2));
+
+            //             if(dist_to_obs < d0 && dist_to_obs > 0.35){
+            //                 if(dist_to_obs < min_dist_obs){
+            //                     min_dist_obs = dist_to_obs;
+            //                     closest_obs_x = obs_x;
+            //                     closest_obs_y = obs_y;
+            //                     found_any_obs = true;
+            //                 }
+            //             }
+            //         }
+            //     }
+            // }
 
             current_progress_id = closest_index;
 
@@ -200,7 +228,7 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
 
             // Dynamic lookahead
             if(found_any_obs == true){
-                search_dist = lookahead_dist - 0.6; // 0.8 (normal mode), 0.4 (cautious mode)
+                search_dist = lookahead_dist + 0.25; 
             }
 
             if(dist_to_final < 0.4){
@@ -250,47 +278,6 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                 target_y = transformed_plan[best_id].pose.position.y;
             }
 
-            // double check_dist = 1.5; // reasonable distance to scan
-
-            // for(int i = closest_index; i < transformed_plan.size(); ++i){ // scan for loop
-            //     double wp_x = transformed_plan[i].pose.position.x;
-            //     double wp_y = transformed_plan[i].pose.position.y;
-
-            //     double dist_to_wp = std::hypot(wp_x - robot_x, wp_y - robot_y);
-            //     if(dist_to_wp > check_dist) break;
-
-            //     unsigned int mx,my;
-            //     if(costmap->worldToMap(wp_x, wp_y, mx, my)){
-            //         if(costmap->getCost(mx,my) >= 128){
-            //             lookahead_dist = 0.6;
-            //             break;
-            //         }
-            //     }
-
-            // }
-
-            // for(int i = closest_index; i < transformed_plan.size(); ++i){ // target waypoint for loop
-            //     double wp_x = transformed_plan[i].pose.position.x;
-            //     double wp_y = transformed_plan[i].pose.position.y;
-
-            //     double dist_to_wp = std::hypot(wp_x - robot_x, wp_y - robot_y);
-                
-            //     if(dist_to_wp > lookahead_dist){
-            //         target_x = wp_x;
-            //         target_y = wp_y;
-
-            //         // target_yaw = std::atan2(target_y - robot_y, target_x - robot_x);
-            //         break;
-            //     }
-            // }
-
-            // if (target_x == 0.0 && target_y == 0.0) {
-            //     target_x = transformed_plan.back().pose.position.x;
-            //     target_y = transformed_plan.back().pose.position.y;
-            // }
-
-
-
             // Attractive force calculation
             f_att_x = k_att * (target_x - robot_x);
             f_att_y = k_att * (target_y - robot_y);
@@ -308,37 +295,6 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
 
             // Repulsive force calculation
 
-            double memory_duration = 1.0;
-
-            if (found_any_obs == true) {
-                // 1. Update the memory with the fresh data
-                last_obs_x_ = closest_obs_x;
-                last_obs_y_ = closest_obs_y;
-                last_b_ = b;
-                last_obs_time_ = ros::Time::now();
-            } 
-            else {
-                // 2. We are blind! Check if we saw something recently
-                double time_since_last_obs = (ros::Time::now() - last_obs_time_).toSec();
-    
-                if (time_since_last_obs < memory_duration) {
-                    // 3. Trigger Object Permanence!
-                    found_any_obs = true;
-                    closest_obs_x = last_obs_x_;
-                    closest_obs_y = last_obs_y_;
-                    b = last_b_; // Restore the side force multiplier
-        
-                    // Re-calculate the distance using the robot's CURRENT moving position 
-                    // against the obstacle's LAST KNOWN world position
-                    min_dist_obs = std::hypot(closest_obs_x - robot_x, closest_obs_y - robot_y);
-        
-                    // If we've driven far enough away, naturally let it go
-                    if (min_dist_obs > d0) {
-                        found_any_obs = false; 
-                    }
-                }
-            }
-
             if(found_any_obs == true){
                 if(min_dist_obs < 0.15) min_dist_obs = 0.15;
 
@@ -350,66 +306,145 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                 f_rep_y = f_rep * ((robot_y - closest_obs_y) / min_dist_obs);
             }
 
-            // Side force calculation
-            double f_side = k_side * b * (1.0 / alpha);
+            // Total force calculation
+            double f_total_x = f_att_x + f_rep_x;
+            double f_total_y = f_att_y + f_rep_y;
 
-            double f_side_x = 0.0;
-            double f_side_y = 0.0;
-            double rep_mag = std::hypot(f_rep_x, f_rep_y);
+            // Planner state management
+            if(current_state_ == NORMAL){
 
-            if(rep_mag > 0.001){
-                // normalized frep components
-                double nfrep_x = f_rep_x / rep_mag;
-                double nfrep_y = f_rep_y / rep_mag;
+                double prev_mag = std::hypot(prev_ftotal_x, prev_ftotal_y);
+                double curr_mag = std::hypot(f_total_x, f_total_y);
 
-                // rotation options (left or right)
-                double cw_x = nfrep_y;
-                double cw_y = -nfrep_x;
+                if(curr_mag > 0.01 && prev_mag > 0.01){
 
-                double ccw_x = -nfrep_y;
-                double ccw_y = nfrep_x;
+                    double num = (f_total_x * prev_ftotal_x) + (f_total_y * prev_ftotal_y);
+                    double denum = curr_mag * prev_mag;
 
-                // dot operation
-                double dot_cw = (cw_x * f_att_x) + (cw_y * f_att_y);
-                double dot_ccw = (ccw_x * f_att_x) + (ccw_y * f_att_y);
+                    double cos_theta = num / denum; // Normalized value based on the research paper
 
-                double tandir_x, tandir_y;
+                    double oscillation_threshold = 0.1; // Lower = more strict, Higher = more tolerant. 
 
-                if (dodge_dir == 0){
-                    if (dot_cw > dot_ccw) {
-                        dodge_dir = 1;
-                    } else {
-                        dodge_dir = -1;
+                    if(cos_theta < oscillation_threshold){
+                        ROS_WARN("APF : Oscillation detected. Switching to AVOIDANCE mode.");
+                        current_state_ = AVOIDANCE;
+                        
+                        local_minima_counter_ = 0;
+                    }
+                }
+            }
+
+            else if(current_state_ == AVOIDANCE){
+                local_minima_counter_++;
+
+                // Local minima detection for complex obstacles and sudden walls.
+                if(local_minima_counter_ > local_minima_threshold_){
+                    ROS_WARN("APF : Impossible obstacle detected. Giving up and letting global replan.");
+                    current_state_ = NORMAL;
+                    return false; // Let PSO save the day
+                }
+
+                // Virtual point generation for manuvering around obstacles
+                int num_points = 20;
+                double R = search_dist / 2; //  Radius around the robot
+
+                double best_score = -1000000.0;
+                double best_vx = target_x;
+                double best_vy = target_y;
+
+                // Weights for tuning
+                double K1 = 1.0; // Momentum : Sudut menguntungkan ke arah waypoint yang dituju
+                double K2 = 1.5; // Direction : Sudut menguntungkan dilihat dari orientasi robot
+                double K3 = 2.0; // Safety : Jarak aman dari rintangan
+                double K4 = 1.0; // Progress : Seberapa jauh dari titik virtual ke waypoint
+
+                for(int i = 0; i < num_points; ++i){
+                    double angle = (i * (2.0 * M_PI / num_points));
+                    double vx = robot_x + R * std::cos(angle);
+                    double vy = robot_y + R * std::sin(angle);
+
+                    // Cek untuk memastikan titik virtual tidak dibawah rintangan
+                    unsigned int mx, my;
+                    bool is_valid = true;
+                    if(costmap->worldToMap(vx, vy, mx, my)){
+                        if(costmap->getCost(mx, my) >= 50){
+                            is_valid = false;
+                        }
+                    }
+                    else {
+                        is_valid = false;
+                    }
+
+                    if(is_valid == false) continue;
+
+                    // Rumus evaluasi sesuai paper yang dibaca
+
+                    // theta 1 
+                    double v_yaw = std::atan2(vy - robot_y, vx - robot_x);
+                    double theta1_diff = v_yaw - robot_yaw;
+                    double cos_theta1 = std::cos(theta1_diff);
+
+                    // theta 2
+                    double goal_dir = std::atan2(final_y - robot_y, final_x - robot_x);
+                    double theta2_diff = v_yaw - goal_dir;
+                    double cos_theta2 = std::cos(theta2_diff);
+
+                    // l1
+                    double l1 = std::hypot(vx - closest_obs_x, vy - closest_obs_y);
+
+                    // l2 (negative karena semakin jauh dari goal semakin buruk)
+                    double l2 = -std::hypot(vx - final_x, vy - final_y);
+
+                    double eval_score = (K1 * cos_theta1) + (K2 * cos_theta2) + (K3 * l1) + (K4 * l2);
+
+                    if(eval_score > best_score){
+                        best_score = eval_score;
+                        best_vx = vx;
+                        best_vy = vy;
                     }
                 }
 
-                if (dodge_dir == 1){
-                    tandir_x = cw_x;
-                    tandir_y = cw_y;
+                if(best_score == -1000000.0){
+                    ROS_WARN("APF : No valid path to manuver around, let's hope PSO can handle this.");
+                    current_state_ = NORMAL;
+                    return false;
                 }
 
-                else if (dodge_dir == -1){
-                    tandir_x = ccw_x;
-                    tandir_y = ccw_y;
+                // Cek udah cukup aman atau belum
+                if(!found_any_obs || min_dist_obs > 0.8){
+                    ROS_INFO("APF : Safe enough, let's go back to NORMAL mode.");
+                    current_state_ = NORMAL;
+                    local_minima_counter_ = 0;
+                }
+                target_x = best_vx;
+                target_y = best_vy;
+
+                f_att_x = k_att * (target_x - robot_x);
+                f_att_y = k_att * (target_y - robot_y);
+
+                double new_att_mag = std::hypot(f_att_x, f_att_y);
+                double new_max_att_mag = k_att * lookahead_dist;
+
+                if(new_att_mag > new_max_att_mag){
+                    double scale = new_max_att_mag / new_att_mag;
+                    f_att_x *= scale;
+                    f_att_y *= scale;
                 }
 
-                double f_side_cap = rep_mag * 1.5;
-                if(f_side > f_side_cap) f_side = f_side_cap;
-
-                // force calculation
-                f_side_x = tandir_x * f_side;
-                f_side_y = tandir_y * f_side;
+                f_total_x = f_att_x + f_rep_x; 
+                f_total_y = f_att_y + f_rep_y;
             }
 
-            // Total force calculation
-            double f_total_x = f_att_x + f_rep_x + f_side_x;
-            double f_total_y = f_att_y + f_rep_y + f_side_y;
+            // Save current total forces as previous for calculation if needed
+            prev_ftotal_x = f_total_x; 
+            prev_ftotal_y = f_total_y; 
+
 
             // Yaw calculation
             target_yaw = std::atan2(f_total_y, f_total_x);
 
             // Velocity calculation
-            double max_vel = 0.4;
+            double max_vel = 0.25;
             double vel_x = f_total_x;
             double vel_y = f_total_y;
             double k_theta = 1.2;
@@ -437,13 +472,10 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             double align_tolerance = 0.26; //prev 0.26 (15 degrees)
 
             // Alignment logic
-            if(is_aligning_ == true){
+            if(current_state_ == NORMAL && !found_any_obs){
                 if(std::abs(yaw_diff) > align_tolerance){
                     local_vel_x = 0.0;
                     local_vel_y = 0.0;
-                }
-                else {
-                    is_aligning_ = false;
                 }
             }
 
@@ -463,37 +495,11 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             if(angular_vel > max_angular_vel) angular_vel = max_angular_vel;
             if(angular_vel < min_angular_vel) angular_vel = min_angular_vel;
 
-            // local minima fallback
-            double stuck_mag_thresh = 0.05; 
-            double f_mag = std::hypot(f_total_x, f_total_y);
-
-            is_stuck_ = false;
-
-            // Don't replan after reaching goal pose
-            if(dist_to_goal < 0.4){
-                is_stuck_ = false;
-
-                cmd_vel.linear.x = local_vel_x;
-                cmd_vel.angular.z = angular_vel;
-                return true;
-            }
-
-            // Replan if and only if magnitude falls below threshold
-            if(f_mag <= stuck_mag_thresh){
-                is_stuck_ = true;
-            }
-
-            if(is_stuck_ == true){
-                return false;
-            }
-
             cmd_vel.linear.x = local_vel_x;
             cmd_vel.linear.y = local_vel_y;
             cmd_vel.angular.z = angular_vel;
 
-            ROS_INFO("Current waypoint: %d | Fside: %.2f | Fatt: %.2f | Frep: %.2f | Force: %.2f", current_progress_id, f_side, att_mag, rep_mag, f_mag);
-
-
+            // ROS_INFO("Current waypoint: %d | Fatt: %.2f | Frep: %.2f | Force: %.2f", current_progress_id, att_mag, rep_mag, f_mag);
 
             return true;
         }
