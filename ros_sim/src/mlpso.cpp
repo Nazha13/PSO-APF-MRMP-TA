@@ -71,13 +71,16 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
         double offset_x = 13.313419; 
         double offset_y = 14.406021;
 
-        double c1 = 2; // cognitive coefficient
-        double c2 = 1; // social coefficient
-        double w = 0.75; // particle inertia weight  
+        double c1_early = 1.5; // cognitive coefficient
+        double c1_late = 0.75;
+        double c2_early = 0.75; // social coefficient
+        double c2_late = 1.5;
+        double w_max = 1.2; // particle inertia weight 
+        double w_min = 0.5; 
         double r1; // coefficient for variation (cognitive personality)
         double r2; // coefficient for variation (social personality)
-        int swarm_size = 100;
-        int max_iter = 150;
+        int swarm_size = 150;
+        int max_iter = 200;
         double start_yaw = 0.0;
 
         std::vector<Node> nodes;
@@ -108,6 +111,8 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
 
             int steps = std::max(1, (int)(distance / res));
 
+            double edge_cost = 0.0;
+
             for(int i = 0; i <= steps; ++i){
                 double t = (double)i / steps;
 
@@ -120,11 +125,14 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
                     unsigned char cost = costmap_->getCost(map_x, map_y);
 
                     if(cost >= 200){
-                        return cost; // Cost scales from 0 - 255;
+                        return 100000.0;
+                    }
+                    else if(cost > 0){
+                        edge_cost += std::pow((double)cost / 255.0,2);
                     }
                 }
             }
-            return 0.0;
+            return edge_cost;
         }
 
         // Function to listen to roadmap topic and store it in a variable that can be used by PSO
@@ -173,15 +181,17 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
             visited[currentNode] = true;
             double currentYaw = start_yaw;
             int steps = 0;
-            int max_steps = 300;
+            int max_steps = current_graph.size();
 
             while(currentNode != goalNode_i && steps < max_steps){
                 Node* n = &current_graph[currentNode];
                 int bestNode = currentNode;
-                double highestValue = -10000; // a random big negative number representing infinity
+                double highestValue = -100000; // a random big negative number representing infinity
                 double tempDist= 0;
                 double tempAngleDiff = 0;
                 double tempYaw = currentYaw;
+
+                bool moved = false;
 
                 for(int i = 0; i < n->neighbours_count; ++i){
                     if(p->pos_i[n->neighbours[i].id] > highestValue && !visited[n->neighbours[i].id]){
@@ -194,8 +204,12 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
                         tempDist = n->neighbours[i].weight;
                         tempAngleDiff = angleDiff;
                         tempYaw = angleToNeighbour;
+                        moved = true;
                     }
                 }
+
+                if(!moved) break;
+
                 currentNode = bestNode;
                 visited[currentNode] = true;
 
@@ -209,7 +223,7 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
                 steps++;
             }
             if(currentNode == goalNode_i) return (totalDistance * w_1) + (totalTurnPenalty * w_2) + (totalEdgePenalty * w_3);
-            else return (totalDistance * w_1) + (totalTurnPenalty * w_2) + 10000.0;
+            else return (totalDistance * w_1) + (totalTurnPenalty * w_2) + 100000.0;
         }
 
         // Function to return best sequence of nodes from start to goal based on gBest
@@ -223,19 +237,26 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
             path.push_back(currentNode);
             visited[currentNode] = true; 
             int steps = 0;
-            int max_steps = 300;
+            int max_steps = current_graph.size();
 
             while(currentNode != goalNode_i && steps < max_steps){
                 Node* n = &current_graph[currentNode];
                 int bestNode = currentNode;
-                double highestValue = 0;
+                double highestValue = -100000;
+
+                bool moved = false;
 
                 for(int i = 0; i < n->neighbours_count; ++i){
                     int neighbour_id = n->neighbours[i].id;
                     if(!visited[neighbour_id] && g->g_pos[neighbour_id] > highestValue){
                         highestValue = g->g_pos[neighbour_id];
                         bestNode = neighbour_id;
+                        moved = true;
                     }
+                }
+                if(!moved){
+                    ROS_WARN("PSO failed to converge on a good solution.");
+                    break;
                 }
                 currentNode = bestNode;
                 path.push_back(currentNode);
@@ -352,65 +373,90 @@ class MLPSO : public nav_core::BaseGlobalPlanner {
 
             gBest.g_pos.resize(local_graph.size());
 
-            gBest.g_score = 100000.0; // distance large enough
+            int max_retries = 10;
+            bool path_found = false;
+            std::vector<int> final_path;
+            int goalNode_i = local_graph.size() - 1;
 
-            // PSO : Initialization section
-            // Init Value (each particles) at t = 0
-            for(int i = 0; i < swarm_size; ++i){
-                for(int j = 0; j < local_graph.size(); ++j){
-                    swarm[i].pos_i[j] = randdbl(0.0,1.0);
-                    swarm[i].velo[j] = 0.0;
-                    swarm[i].pBestPos[j] = swarm[i].pos_i[j];
-                }
-                swarm[i].pBest_score = calculateFitness(&swarm[i],local_graph);
-                swarm[i].score = calculateFitness(&swarm[i],local_graph);
-            }
+            for (int retry = 0; retry < max_retries; ++retry) {
 
-            // Init Value of gBest amongst all particles
-            for(int i = 0 ; i < swarm_size ; ++i){
-                if(swarm[i].score < gBest.g_score){
-                    gBest.g_score = swarm[i].score;
+                gBest.g_score = 1000000.0;
 
-                    for(int j = 0; j < local_graph.size() ; ++j){
-                        gBest.g_pos[j] = swarm[i].pos_i[j];
+                // PSO : Initialization section
+                for(int i = 0; i < swarm_size; ++i){
+                    for(int j = 0; j < local_graph.size(); ++j){
+                        swarm[i].pos_i[j] = randdbl(0.0,1.0);
+                        swarm[i].velo[j] = 0.0;
+                        swarm[i].pBestPos[j] = swarm[i].pos_i[j];
                     }
+                    swarm[i].pBest_score = calculateFitness(&swarm[i],local_graph);
+                    swarm[i].score = calculateFitness(&swarm[i],local_graph);
                 }
-            }
 
-            // Iteration loop (start at t = 1)
-            for(int i = 0; i < max_iter; ++i){
-                // Particle loop
-                for(int j = 0; j < swarm_size; ++j){
-                    for(int k = 0; k < local_graph.size(); ++k){
-                        r1 = randdbl(0,1);
-                        r2 = randdbl(0,1);
+                // Init Value of gBest amongst all particles
+                for(int i = 0 ; i < swarm_size ; ++i){
+                    if(swarm[i].score < gBest.g_score){
+                        gBest.g_score = swarm[i].score;
 
-                        // PSO velocity and position updates
-                        swarm[j].velo[k] = w*swarm[j].velo[k] + c1*(swarm[j].pBestPos[k] - swarm[j].pos_i[k])*r1 + c2*(gBest.g_pos[k] - swarm[j].pos_i[k])*r2;
-                        swarm[j].pos_i[k] += swarm[j].velo[k];
-                    }
-                    swarm[j].score = calculateFitness(&swarm[j],local_graph);
-
-                    if(swarm[j].score < swarm[j].pBest_score){
-                        swarm[j].pBest_score = swarm[j].score;
-
-                        for(int k = 0; k < local_graph.size(); ++k){
-                            swarm[j].pBestPos[k] = swarm[j].pos_i[k];
+                        for(int j = 0; j < local_graph.size() ; ++j){
+                            gBest.g_pos[j] = swarm[i].pos_i[j];
                         }
                     }
+                }
 
-                    if(swarm[j].score < gBest.g_score){
-                        gBest.g_score = swarm[j].score;
+                // Iteration loop (start at t = 1)
+                for(int i = 0; i < max_iter; ++i){
 
+                    double w = w_max - ((w_max - w_min) * ((double)i / max_iter));
+                    double c1 = c1_early - ((c1_early - c1_late) * ((double)i / max_iter));
+                    double c2 = c2_early + ((c2_late - c2_early) * ((double)i / max_iter));
+
+                    // Particle loop
+                    for(int j = 0; j < swarm_size; ++j){
                         for(int k = 0; k < local_graph.size(); ++k){
-                            gBest.g_pos[k] = swarm[j].pos_i[k];
+                            r1 = randdbl(0,1);
+                            r2 = randdbl(0,1);
+
+                            // PSO velocity and position updates
+                            swarm[j].velo[k] = w*swarm[j].velo[k] + c1*(swarm[j].pBestPos[k] - swarm[j].pos_i[k])*r1 + c2*(gBest.g_pos[k] - swarm[j].pos_i[k])*r2;
+                            swarm[j].pos_i[k] += swarm[j].velo[k];
+                        }
+                        swarm[j].score = calculateFitness(&swarm[j],local_graph);
+
+                        if(swarm[j].score < swarm[j].pBest_score){
+                            swarm[j].pBest_score = swarm[j].score;
+
+                            for(int k = 0; k < local_graph.size(); ++k){
+                                swarm[j].pBestPos[k] = swarm[j].pos_i[k];
+                            }
+                        }
+
+                        if(swarm[j].score < gBest.g_score){
+                            gBest.g_score = swarm[j].score;
+
+                            for(int k = 0; k < local_graph.size(); ++k){
+                                gBest.g_pos[k] = swarm[j].pos_i[k];
+                            }
                         }
                     }
+                }
 
+                final_path = calculateFinale(&gBest, local_graph);
+
+                if(!final_path.empty() && final_path.back() == goalNode_i){
+                    path_found = true;
+                    ROS_WARN("PSO converged on a solution in retry %d.", retry + 1);
+                    break;
+                }
+                else{
+                    ROS_WARN("PSO failed to converge on a solution in retry %d. Retrying...", retry + 1);
                 }
             }
 
-            std::vector<int> final_path = calculateFinale(&gBest, local_graph);
+            if(!path_found){
+                ROS_ERROR("PSO failed to find a valid path after %d retries.", max_retries);
+                return false;
+            }
 
             nav_msgs::Path final_pso_path;
             final_pso_path.header.frame_id = "map";
