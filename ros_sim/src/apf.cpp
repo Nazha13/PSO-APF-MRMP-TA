@@ -35,13 +35,13 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
         costmap_2d::Costmap2DROS* costmap_ros_;
 
         // APF variables
-        double k_att = 3.0;
+        double k_att = 2.0;
         double f_att_x = 0.0;
         double f_att_y = 0.0;
-        double k_rep = 1.5;
+        double k_rep = 1.0;
         double f_rep_x = 0.0;
         double f_rep_y = 0.0;
-        double d0 = 0.7;
+        double d0 = 0.8;
 
         // Fallback within fallback SM variables
         enum apf_state {NORMAL, AVOIDANCE};
@@ -54,16 +54,50 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
         int local_minima_counter_ = 0;
         int local_minima_threshold_ = 50;
 
+        int avoidance_counter_ = 0;
+        int avoidance_threshold_ = 200; // 20 second time to avoid
+      
         double v_target_x = 0.0;
         double v_target_y = 0.0;
 
         // Wp tracking variables
         int current_progress_id = 0;
 
-        double lookahead_dist = 0.65;
+        double lookahead_dist = 0.6;
         double target_yaw = 0.0;
 
         bool is_safe_ = true;
+
+        ros::Time last_avoidance_time_ = ros::Time(0);
+
+        ros::Time last_pose_time_ = ros::Time(0);
+        double last_pose_x_ = 0.0;
+        double last_pose_y_ = 0.0;
+        double stuck_time_threshold_ = 3.0; // seconds
+        double stuck_distance_threshold_ = 0.05; // meters 
+
+        bool pathCost(double start_x, double start_y, double end_x, double end_y, costmap_2d::Costmap2D* costmap){
+            double dist = std::hypot(end_x - start_x, end_y - start_y);
+            int steps = std::max(1, (int)std::ceil(dist / (costmap->getResolution()))); // std max to avoid division by zero when robot is too close to goal
+
+            // Sampling points along the line from start to end using linear interpolation (parameteric)
+            for(int i = 0; i <= steps; ++i){
+                double t = (double)i / steps;
+                double sample_x = start_x + t * (end_x - start_x);
+                double sample_y = start_y + t * (end_y - start_y);
+
+                unsigned int mx, my;
+                if(costmap->worldToMap(sample_x, sample_y, mx, my)){
+                    if(costmap->getCost(mx, my) >= 128){ // So robot stays in avoidance mode in tight spaces.
+                        return false;
+                    }
+                }
+                else {
+                    return false;
+                }
+            }
+            return true;
+        }
 
     public:
         APFPlanner() {}
@@ -110,6 +144,32 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             double robot_y = global_pose.pose.position.y;
             double robot_yaw = tf2::getYaw(global_pose.pose.orientation);
 
+            ros::Time now = ros::Time::now();
+
+            if(last_pose_time_ == ros::Time(0)){
+                last_pose_time_ = now;
+                last_pose_x_ = robot_x;
+                last_pose_y_ = robot_y;
+            }
+
+            if((now - last_pose_time_).toSec() > stuck_time_threshold_){
+                double dist_moved = std::hypot(robot_x - last_pose_x_, robot_y - last_pose_y_);
+                
+                if(dist_moved < stuck_distance_threshold_){
+                    ROS_WARN("APF: Robot seems to be stuck either from local minima or flickering states.");
+                    current_state_ = NORMAL;
+                    last_pose_time_ = ros::Time(0);
+                    avoidance_counter_ = 0;
+
+                    return false;
+                }
+                else {
+                    last_pose_time_ = now;
+                    last_pose_x_ = robot_x;
+                    last_pose_y_ = robot_y;
+                }
+            }
+
             // read the robot's goal (crucial for final check)
             double goal_x = global_plan_.back().pose.position.x;
             double goal_y = global_plan_.back().pose.position.y;
@@ -126,6 +186,14 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                     transformed_plan)) {
                 
                 ROS_WARN("APF Debugger: TF Transform failed. Halting robot for safety.");
+                cmd_vel.linear.x = 0.0;
+                cmd_vel.linear.y = 0.0;
+                cmd_vel.angular.z = 0.0;
+                return false; 
+            }
+
+            if(transformed_plan.empty()){
+                ROS_WARN("APF Debugger: Transformed plan is empty. Halting robot for safety.");
                 cmd_vel.linear.x = 0.0;
                 cmd_vel.linear.y = 0.0;
                 cmd_vel.angular.z = 0.0;
@@ -169,7 +237,7 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                 for(int i = min_x; i <= max_x; ++i){
                     for(int j = min_y; j <= max_y; ++j){
 
-                        if(costmap->getCost(i,j) >= 50){
+                        if(costmap->getCost(i,j) >= 200){
 
                             double obs_x;
                             double obs_y;
@@ -177,7 +245,7 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
 
                             double dist_to_obs = std::hypot(obs_x - robot_x, obs_y - robot_y);
 
-                            if(dist_to_obs < d0){
+                            if(dist_to_obs < 1.0){
                                 if(dist_to_obs < min_dist_obs){
                                     min_dist_obs = dist_to_obs;
                                     closest_obs_x = obs_x;
@@ -226,9 +294,9 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             double final_y = transformed_plan.back().pose.position.y;
             double dist_to_final = std::hypot(final_x - robot_x, final_y - robot_y);
 
-            // Dynamic lookahead
+            // Dynamic lookahead setup if needed, if not just go with lookahead dist.
             if(found_any_obs == true){
-                search_dist = lookahead_dist + 0.25; 
+                search_dist = lookahead_dist; 
             }
 
             if(dist_to_final < 0.4){
@@ -254,7 +322,7 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                                 int check_y = my + dy;
 
                                 if(check_x >= 0 && check_x < size_x && check_y >= 0 && check_y < size_y){
-                                    if(costmap->getCost(check_x, check_y) >= 50){
+                                    if(costmap->getCost(check_x, check_y) >= 200){
                                         is_safe_ = false;
                                         break;
                                     }
@@ -274,6 +342,9 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                         break;
                     }
                 }
+
+                if(best_id >= transformed_plan.size()) best_id = transformed_plan.size() - 1;
+
                 target_x = transformed_plan[best_id].pose.position.x;
                 target_y = transformed_plan[best_id].pose.position.y;
             }
@@ -293,25 +364,31 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                 f_att_y *= scale;
             }
 
-            // Repulsive force calculation
-
-            if(found_any_obs == true){
-                if(min_dist_obs < 0.15) min_dist_obs = 0.15;
-
-                // Repulsive force resultant calculation
-                double f_rep = k_rep * ((1.0 / min_dist_obs) - (1.0 / d0)) * std::pow((1.0 / min_dist_obs), 2);
-                        
-                // X and Y components of repulsive force
-                f_rep_x = f_rep * ((robot_x - closest_obs_x) / min_dist_obs);
-                f_rep_y = f_rep * ((robot_y - closest_obs_y) / min_dist_obs);
-            }
-
-            // Total force calculation
-            double f_total_x = f_att_x + f_rep_x;
-            double f_total_y = f_att_y + f_rep_y;
+            double f_total_x = 0.0;
+            double f_total_y = 0.0;
 
             // Planner state management
             if(current_state_ == NORMAL){
+
+                // reset tuning variables
+                k_rep = 1.0; d0 = 0.8; 
+
+                // Repulsive force calculation
+
+                if(found_any_obs == true){
+                    if(min_dist_obs < 0.15) min_dist_obs = 0.15;
+
+                    // Repulsive force resultant calculation
+                    double f_rep = k_rep * ((1.0 / min_dist_obs) - (1.0 / d0)) * std::pow((1.0 / min_dist_obs), 2);
+                        
+                    // X and Y components of repulsive force
+                    f_rep_x = f_rep * ((robot_x - closest_obs_x) / min_dist_obs);
+                    f_rep_y = f_rep * ((robot_y - closest_obs_y) / min_dist_obs);
+                }
+
+                // Total force calculation
+                f_total_x = f_att_x + f_rep_x;
+                f_total_y = f_att_y + f_rep_y;
 
                 double prev_mag = std::hypot(prev_ftotal_x, prev_ftotal_y);
                 double curr_mag = std::hypot(f_total_x, f_total_y);
@@ -323,40 +400,46 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
 
                     double cos_theta = num / denum; // Normalized value based on the research paper
 
-                    double oscillation_threshold = 0.1; // Lower = more strict, Higher = more tolerant. 
+                    double oscillation_threshold = 0.43; // Lower = more strict, Higher = more tolerant. 
 
                     if(cos_theta < oscillation_threshold){
-                        ROS_WARN("APF : Oscillation detected. Switching to AVOIDANCE mode.");
-                        current_state_ = AVOIDANCE;
-                        
-                        local_minima_counter_ = 0;
+                        if((ros::Time::now() - last_avoidance_time_).toSec() > 3.0){
+                            ROS_WARN("APF : Oscillation detected. Switching to AVOIDANCE mode.");
+                            current_state_ = AVOIDANCE;
+                            local_minima_counter_ = 0;
+                        }
                     }
                 }
+
             }
 
             else if(current_state_ == AVOIDANCE){
-                local_minima_counter_++;
+                avoidance_counter_++;
 
-                // Local minima detection for complex obstacles and sudden walls.
-                if(local_minima_counter_ > local_minima_threshold_){
-                    ROS_WARN("APF : Impossible obstacle detected. Giving up and letting global replan.");
+                k_rep = 0.01; d0 = 0.6;
+
+                if(avoidance_counter_ > avoidance_threshold_){
+                    ROS_WARN("APF : Stuck in avoidance for too long. Let's see what PSO can do.");
                     current_state_ = NORMAL;
-                    return false; // Let PSO save the day
+                    avoidance_counter_ = 0;
+                    return false;
                 }
 
                 // Virtual point generation for manuvering around obstacles
-                int num_points = 20;
+                int num_points = 40;
                 double R = search_dist / 2; //  Radius around the robot
 
                 double best_score = -1000000.0;
                 double best_vx = target_x;
                 double best_vy = target_y;
+                double global_target_x = target_x;
+                double global_target_y = target_y;
 
                 // Weights for tuning
-                double K1 = 1.0; // Momentum : Sudut menguntungkan ke arah waypoint yang dituju
+                double K1 = 3.0; // Momentum : Sudut menguntungkan ke arah waypoint yang dituju
                 double K2 = 1.5; // Direction : Sudut menguntungkan dilihat dari orientasi robot
-                double K3 = 2.0; // Safety : Jarak aman dari rintangan
-                double K4 = 1.0; // Progress : Seberapa jauh dari titik virtual ke waypoint
+                double K3 = 8.0; // Safety : Jarak aman dari rintangan
+                double K4 = 1.5; // Progress : Seberapa jauh dari titik virtual ke waypoint
 
                 for(int i = 0; i < num_points; ++i){
                     double angle = (i * (2.0 * M_PI / num_points));
@@ -367,7 +450,7 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                     unsigned int mx, my;
                     bool is_valid = true;
                     if(costmap->worldToMap(vx, vy, mx, my)){
-                        if(costmap->getCost(mx, my) >= 50){
+                        if(costmap->getCost(mx, my) >= 128){
                             is_valid = false;
                         }
                     }
@@ -385,17 +468,23 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                     double cos_theta1 = std::cos(theta1_diff);
 
                     // theta 2
-                    double goal_dir = std::atan2(final_y - robot_y, final_x - robot_x);
+                    double goal_dir = std::atan2(target_y - robot_y, target_x - robot_x);
                     double theta2_diff = v_yaw - goal_dir;
                     double cos_theta2 = std::cos(theta2_diff);
 
                     // l1
-                    double l1 = std::hypot(vx - closest_obs_x, vy - closest_obs_y);
+                    // double l1 = std::hypot(vx - closest_obs_x, vy - closest_obs_y);
+
+                    double cost_penalty = 0.0;
+
+                    if(costmap->worldToMap(vx, vy, mx, my)){
+                        cost_penalty = (double)costmap->getCost(mx,my) / 128.0;
+                    }
 
                     // l2 (negative karena semakin jauh dari goal semakin buruk)
-                    double l2 = -std::hypot(vx - final_x, vy - final_y);
+                    double l2 = -std::hypot(vx - target_x, vy - target_y);
 
-                    double eval_score = (K1 * cos_theta1) + (K2 * cos_theta2) + (K3 * l1) + (K4 * l2);
+                    double eval_score = (K1 * cos_theta1) + (K2 * cos_theta2) - (K3 * cost_penalty) + (K4 * l2);
 
                     if(eval_score > best_score){
                         best_score = eval_score;
@@ -405,16 +494,21 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                 }
 
                 if(best_score == -1000000.0){
-                    ROS_WARN("APF : No valid path to manuver around, let's hope PSO can handle this.");
-                    current_state_ = NORMAL;
-                    return false;
+                    ROS_WARN("APF : No valid virtual point found! spinning in place to find at least 1");
+                    cmd_vel.linear.x = 0.0;
+                    cmd_vel.linear.y = 0.0;
+                    cmd_vel.angular.z = 0.5; // Spin in place to search for a valid point
+                    return true;
                 }
 
+
                 // Cek udah cukup aman atau belum
-                if(!found_any_obs || min_dist_obs > 0.8){
+                if(pathCost(robot_x, robot_y, global_target_x, global_target_y, costmap) == true && min_dist_obs > 0.6){
                     ROS_INFO("APF : Safe enough, let's go back to NORMAL mode.");
                     current_state_ = NORMAL;
-                    local_minima_counter_ = 0;
+                    avoidance_counter_ = 0;
+
+                    last_avoidance_time_ = ros::Time::now();
                 }
                 target_x = best_vx;
                 target_y = best_vy;
@@ -431,7 +525,21 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
                     f_att_y *= scale;
                 }
 
-                f_total_x = f_att_x + f_rep_x; 
+                // Repulsive force calculation
+
+                if(found_any_obs == true){
+                    if(min_dist_obs < 0.15) min_dist_obs = 0.15;
+
+                    // Repulsive force resultant calculation
+                    double f_rep = k_rep * ((1.0 / min_dist_obs) - (1.0 / d0)) * std::pow((1.0 / min_dist_obs), 2);
+                        
+                    // X and Y components of repulsive force
+                    f_rep_x = f_rep * ((robot_x - closest_obs_x) / min_dist_obs);
+                    f_rep_y = f_rep * ((robot_y - closest_obs_y) / min_dist_obs);
+                }
+
+                // Total force calculation
+                f_total_x = f_att_x + f_rep_x;
                 f_total_y = f_att_y + f_rep_y;
             }
 
@@ -469,15 +577,15 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             double local_vel_x = vel_x * std::cos(robot_yaw) + vel_y * std::sin(robot_yaw);
             double local_vel_y = -vel_x * std::sin(robot_yaw) + vel_y * std::cos(robot_yaw);
 
-            double align_tolerance = 0.26; //prev 0.26 (15 degrees)
+            double align_tolerance = 0.52; //prev 0.26 (15 degrees)
 
             // Alignment logic
-            if(current_state_ == NORMAL && !found_any_obs){
+            // if(current_state_ == NORMAL && !found_any_obs){
                 if(std::abs(yaw_diff) > align_tolerance){
-                    local_vel_x = 0.0;
+                    local_vel_x = 0.02;
                     local_vel_y = 0.0;
                 }
-            }
+            // }
 
             double dist_to_goal = std::sqrt(std::pow(goal_x - robot_x, 2) + std::pow(goal_y - robot_y, 2));
 
@@ -500,6 +608,21 @@ class APFPlanner : public nav_core::BaseLocalPlanner {
             cmd_vel.angular.z = angular_vel;
 
             // ROS_INFO("Current waypoint: %d | Fatt: %.2f | Frep: %.2f | Force: %.2f", current_progress_id, att_mag, rep_mag, f_mag);
+            // ROS_INFO("Force x: %.2f | Force y: %.2f", f_total_x, f_total_y);
+
+            // ----- DEBUG TELEMETRY -----
+            // std::string state_str = (current_state_ == NORMAL) ? "NORMAL" : "AVOID";
+            
+            // ROS_INFO("----------------------------------------");
+            // ROS_INFO("[State]: %s | [Min Dist Obs]: %.2fm", state_str.c_str(), min_dist_obs);
+            
+            // if(current_state_ == AVOIDANCE) {
+            //     ROS_INFO("[VP Target]: X: %.2f, Y: %.2f", target_x, target_y);
+            // }
+
+            // ROS_INFO("[Forces] F_att: (%.2f, %.2f) | F_rep: (%.2f, %.2f)", f_att_x, f_att_y, f_rep_x, f_rep_y);
+            // ROS_INFO("[Output] YawDiff: %.2f rad | Vx: %.2f | Wz: %.2f", yaw_diff, local_vel_x, angular_vel);
+            // ROS_INFO("----------------------------------------");
 
             return true;
         }
